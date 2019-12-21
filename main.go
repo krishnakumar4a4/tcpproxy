@@ -1,17 +1,18 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"github.com/spf13/cobra"
 	"io"
-	"os"
 	"io/ioutil"
 	"log"
 	"net"
-	"strings"
-	"time"
+	"os"
 	"runtime"
-	"github.com/spf13/cobra"
-	"encoding/json"
+	"strings"
+	"sync/atomic"
+	"time"
 )
 
 var rootCmd *cobra.Command
@@ -27,9 +28,9 @@ var totDownloadBytes int64
 var totDownloadDuration int64
 
 type Conf struct {
-	Port int `json:targetport`
-	Proxyip string `json:proxyip`
-	Proxyport int `json:proxyport`
+	Port           int      `json:port`
+	Proxyip        string   `json:proxyip`
+	Proxyport      int      `json:proxyport`
 	Alloweddomains []string `json:alloweddomains`
 }
 
@@ -43,45 +44,74 @@ func main() {
 }
 
 func init() {
-	readConf()
-	rootCmd = &cobra.Command {
-		Use: "tunproxy",
-		Short: "A Proxy coupled with ssh reverse tunnel",
-		Long: "A Local proxy server coupled with SSH reverse tunnel to provide internet access to remote machines using local proxy server",
+	c, err := readConf()
+	rootCmd = &cobra.Command{
+		Use:   "tunproxy",
+		Short: "A transparent proxy",
+		Long:  "A transparent proxy server with support to be chained with downstream proxy and rate calculator",
 		Run: func(cmd *cobra.Command, args []string) {
 			start()
 		},
 	}
-	rootCmd.Flags().IntVarP(&port, "port","p",3129,"Tunneled listening port on remote server")
-
-	rootCmd.Flags().StringVarP(&proxyIp, "proxy-ip","","","Proxy ip address to be used")
-	rootCmd.Flags().IntVarP(&proxyPort, "proxy-port","",3128,"Proxy port to be used")
-	rootCmd.Flags().BoolVarP(&noProxy, "no-proxy","",false,"If wanted to disbale default proxy(localhost:3128) configuration")
-
-	rootCmd.MarkFlagRequired("port")
+	localPort := 0
+	localProxyIp := ""
+	localProxyPort := 0
+	if err == nil {
+		localPort = c.Port
+		localProxyIp = c.Proxyip
+		localProxyPort = c.Proxyport
+	}
+	rootCmd.Flags().IntVarP(&port, "port", "p", localPort, "Port")
+	rootCmd.Flags().StringVar(&proxyIp, "proxy-ip", localProxyIp, "Downstream proxy ip address if exists")
+	rootCmd.Flags().IntVar(&proxyPort, "proxy-port", localProxyPort, "Downstream proxy port")
+	rootCmd.Flags().BoolVar(&noProxy, "no-proxy", false, "No downstream proxy")
+	if port == 0 {
+		rootCmd.MarkFlagRequired("port")
+	}
 }
 
 func start() {
+	fmt.Println("port: ", port)
+	fmt.Println("no-proxy", noProxy)
+	if (port == 0) || (!noProxy && (proxyIp == "" || proxyPort == 0)) {
+		fmt.Println("missing params port/proxy-ip/proxy-port")
+		return
+	}
+	if !noProxy {
+		fmt.Println("downstream proxy-ip : ", proxyIp)
+		fmt.Println("downstream proxy-port : ", proxyPort)
+	}
+	fmt.Println("allowed domains: ", conf.Alloweddomains)
+
 	l, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", port))
 	if err != nil {
-		log.Fatal("unable to register tcp forward: ", err)
+		log.Fatalf("unable to listen on port: %v, err: %v", port, err.Error())
 		return
 	}
 	defer l.Close()
+	go func() {
+		for {
+			time.Sleep(time.Second * 5)
+			fmt.Println("Number of go routines: ", runtime.NumGoroutine())
+			if totUploadDuration == 0 || totDownloadDuration == 0 {
+				continue
+			}
+			uploadSpeed := float32(totUploadBytes) / (float32(totUploadDuration) / (1000000000))
+			downloadSpeed := float32(totDownloadBytes) / (float32(totDownloadDuration) / (1000000000))
+			fmt.Printf("upload speed n: %v, d: %v, %v bytes/sec\n", totUploadBytes, float32(totUploadDuration)/(1000000000), int64(uploadSpeed))
+			fmt.Printf("download speed n: %v, d: %v, %v bytes/sec\n", totDownloadBytes, float32(totDownloadDuration)/(1000000000), int64(downloadSpeed))
+		}
+	}()
 
-	fmt.Println("read started")
 	for {
 		tcpConn, err := l.Accept()
 		if err != nil {
 			fmt.Println("error tcp accept: ", err)
 			return
 		}
-		fmt.Println("connection accepted")
+		fmt.Println("new connection accepted")
 
-		fmt.Println("Number of go routines running after accept ", runtime.NumGoroutine())
-	
 		go func() {
-			waitChan := make(chan int)
 			url, connectBytes := parseConnect(tcpConn)
 			fmt.Println("url: ", url)
 			urlParts := strings.Split(url, ":")
@@ -98,13 +128,13 @@ func start() {
 				fmt.Println(fmt.Sprintf("This domain %v is blocked", domainName))
 				return
 			}
-		
+
 			var isProxyEnabled bool
 			if (proxyIp != "" || proxyPort != 0) && !noProxy {
-				isProxyEnabled = true				
+				isProxyEnabled = true
 			}
 			if isProxyEnabled {
-				url = fmt.Sprintf("%v:%v",proxyIp, proxyPort)
+				url = fmt.Sprintf("%v:%v", proxyIp, proxyPort)
 				fmt.Println("connected to proxy url:", url)
 			}
 			targetConn, err := net.Dial("tcp", url)
@@ -116,144 +146,51 @@ func start() {
 				targetConn.Write(connectBytes)
 				BUFSIZE := 1024 * 5
 				targetConnBuf := make([]byte, BUFSIZE)
-				targetConn.Read(targetConnBuf)
+				n, err := targetConn.Read(targetConnBuf)
+				if n > 0 {
+					tcpConn.Write(targetConnBuf[:n])
+				}
+				if err != nil {
+					if err == io.EOF {
+						fmt.Println("reading from tcp conn, EOF")
+					}
+					fmt.Println("tcpConn Read err: ", err)
+				}
 			}
-			proxy(tcpConn, targetConn, waitChan)
-			<- waitChan
-			fmt.Println("Ended go routine for url ", url)
-			fmt.Println("Number of go routines running after connection", runtime.NumGoroutine()-1)
+			proxy(tcpConn, targetConn)
 		}()
 	}
 }
 
-func readConf() error {
-	data, err := ioutil.ReadFile("conf.json")
-	if err != nil {
-		return err
-	}
-	err = json.Unmarshal(data, &conf)
-	if err != nil {
-		return err
-	}
-	fmt.Println("conf read", conf)
-	if port == 0 {
-		port = conf.Port
-	}
-	if proxyIp == "" {
-		proxyIp = conf.Proxyip
-	}
-	if proxyPort == 0 {
-		proxyPort = conf.Proxyport
-	}
-	return nil
-}
-
-func sumUploadStats(n int, a time.Time) {
-	d := time.Now().Sub(a)
-	totUploadBytes += int64(n)
-	totUploadDuration += int64(d)
-}
-
-func sumDownloadStats(n int, a time.Time) {
-	d := time.Now().Sub(a)
-	totDownloadBytes += int64(n)
-	totDownloadDuration += int64(d)
-}
-
-func proxy(tcpConn, targetConn net.Conn, waitChan chan int) {
-	BUFSIZE := 1024 * 5
+func proxy(tcpConn, targetConn net.Conn) {
 	go func() {
 		for {
-			tcpConnBuf := make([]byte, BUFSIZE)
-			fmt.Println("reading from ssh conn")
-			n, err := tcpConn.Read(tcpConnBuf)
-			// fmt.Printf("tcpConnBuf: %v, size: %v", hex.EncodeToString(tcpConnBuf[:n]), n)
-			if n != 0 {
-				fmt.Println("wrote to target conn")
-				// fmt.Println("tcpConn data", string(tcpConnBuf))
-				a := time.Now()
-				targetConn.Write(tcpConnBuf[:n])
-				sumUploadStats(n, a)
-			}
-			if err != nil {
-				if err == io.EOF {
-					fmt.Println("reading from ssh conn, EOF")
-				}
-				fmt.Println("Read all err: ", err)
-				break
-			}
-		}
-	}()
-	go func() {
-		for {
-			targetConnBuf := make([]byte, BUFSIZE)
-			fmt.Println("reading from target conn")
-
-			// Timeout implementation for read
-			timeoutChan := make(chan int)
-			timer := time.NewTimer(10 * time.Second)
-			go func() {
-				timeout(timer, targetConn, timeoutChan)
-			}()
-
-			// Reading from target
 			a := time.Now()
-			n, err := targetConn.Read(targetConnBuf)
-			fmt.Println("finishing timer")
-			sumDownloadStats(n, a)
-
-			// Clean up timer, in case succefully read from target in time
-			timer.Stop()
-			go func() { 
-				defer func() {
-					if r := recover(); r != nil {
-						fmt.Println("timeout channel blew, recovering and doing nothing as I dont care")
-					}
-				}()
-				timeoutChan <- 1 
-			}()
-
-			// fmt.Printf("targetConnBuf: %v, size: %v", hex.EncodeToString(targetConnBuf[:n]), n)
-			fmt.Println("Number of go routines running ", runtime.NumGoroutine())
-			
-			// Read some non-zero bytes from target
-			if n != 0 {
-				fmt.Println("wrote to ssh conn")
-				// fmt.Println("targetConn data", string(targetConnBuf))
-				tcpConn.Write(targetConnBuf[:n])
+			tcpConn.SetDeadline(a.Add(10 * time.Second))
+			n, err := io.Copy(targetConn, tcpConn)
+			if n > 0 {
+				sumUploadStats(int(n), a)
 			}
-
-			// Break on error
 			if err != nil {
-				if err == io.EOF {
-					fmt.Println("reading from target conn, EOF")
-				}
-				fmt.Println("Read all err: ", err)
-
-				// when target connection is done, we will signal to bring down this go routine to parent
-				waitChan <- 1
+				fmt.Println("error while copying from tcpConn", err)
 				break
 			}
 		}
 	}()
-}
-
-func timeout(timer *time.Timer, targetConn net.Conn, timeoutChan chan int) {
-	fmt.Println("started timeout")
-	select  {
-		case a := <- timer.C:
-			err := targetConn.Close()
-			fmt.Println("ended timeout closing targetConn with err ", err, a)
-			var uploadSpeed float32
-			var downloadSpeed float32
-			uploadSpeed = float32(totUploadBytes)/(float32(totUploadDuration)/(1000000000))
-			downloadSpeed = float32(totDownloadBytes)/(float32(totDownloadDuration)/(1000000000))
-			fmt.Printf("upload speed n: %v, d: %v, %v bytes/sec\n", totUploadBytes, float32(totUploadDuration)/(1000000000), int64(uploadSpeed))
-			fmt.Printf("download speed n: %v, d: %v, %v bytes/sec\n", totDownloadBytes, float32(totDownloadDuration)/(1000000000), int64(downloadSpeed))
-			close(timeoutChan)
-		case <- timeoutChan:
-			fmt.Println("ended timeout casually")
-	}
+	go func() {
+		for {
+			a := time.Now()
+			targetConn.SetDeadline(a.Add(10 * time.Second))
+			n, err := io.Copy(tcpConn, targetConn)
+			if n > 0 {
+				sumDownloadStats(int(n), a)
+			}
+			if err != nil {
+				fmt.Println("error while copying from targetConn", err)
+				break
+			}
+		}
+	}()
 }
 
 func resetCRLF(cr1, cr2, lf1, lf2 *bool) {
@@ -315,4 +252,29 @@ func parseConnect(tcpConn io.ReadWriter) (string, []byte) {
 	lines := strings.Split(totReqString, "\n")
 	urls := strings.Split(lines[0], " ")
 	return urls[1], totReqBytes
+}
+
+func readConf() (*Conf, error) {
+	data, err := ioutil.ReadFile("conf.json")
+	if err != nil {
+		return nil, err
+	}
+	err = json.Unmarshal(data, &conf)
+	if err != nil {
+		return nil, err
+	}
+	fmt.Println("conf read", conf)
+	return &conf, nil
+}
+
+func sumUploadStats(n int, a time.Time) {
+	d := time.Now().Sub(a)
+	atomic.AddInt64(&totUploadBytes, int64(n))
+	atomic.AddInt64(&totUploadDuration, int64(d))
+}
+
+func sumDownloadStats(n int, a time.Time) {
+	d := time.Now().Sub(a)
+	atomic.AddInt64(&totDownloadBytes, int64(n))
+	atomic.AddInt64(&totDownloadDuration, int64(d))
 }

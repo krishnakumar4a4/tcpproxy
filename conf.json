@@ -1,7 +1,11 @@
 {
 	"port": 2345,
+	"proxyip": "localhost",
+	"proxyport": 3128,
 	"alloweddomains": [
 		"google.com",
-		"gaana.com"
+		"gaana.com",
+		"google.co.in",
+		"github.com"
 	]
 }
