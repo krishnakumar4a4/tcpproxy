@@ -112,10 +112,21 @@ func start() {
 		fmt.Println("new connection accepted")
 
 		go func() {
-			url, connectBytes := parseConnect(tcpConn)
-			fmt.Println("url: ", url)
-			urlParts := strings.Split(url, ":")
-			domainName := urlParts[0]
+			var domainName string
+			var connectBytes []byte
+			var url string
+			connect, connectBuf := isConnectRequest(tcpConn)
+			if connect {
+				url, connectBytes = parseConnect(tcpConn, connectBuf)
+				fmt.Println("url: ", url)
+				urlParts := strings.Split(url, ":")
+				domainName = urlParts[0]
+			} else {
+				url, connectBytes = parseHTTPURL(tcpConn, connectBuf)
+				fmt.Println("url: ", url)
+				domainName = url
+				url = fmt.Sprintf("%s:%s", domainName, "80")
+			}
 			var isAllowedDomain bool
 			for _, dName := range conf.Alloweddomains {
 				if dName == domainName {
@@ -139,10 +150,10 @@ func start() {
 			}
 			targetConn, err := net.Dial("tcp", url)
 			if err != nil {
-				fmt.Println("Unable to connect to target host: ", url)
+				fmt.Println("Unable to connect to target host: ", url, " err: ", err)
 				return
 			}
-			if isProxyEnabled {
+			if connect && isProxyEnabled {
 				targetConn.Write(connectBytes)
 				BUFSIZE := 1024 * 5
 				targetConnBuf := make([]byte, BUFSIZE)
@@ -155,6 +166,12 @@ func start() {
 						fmt.Println("reading from tcp conn, EOF")
 					}
 					fmt.Println("tcpConn Read err: ", err)
+				}
+			}
+			if !connect {
+				_, err := targetConn.Write(connectBytes)
+				if err != nil {
+					fmt.Println("error while writing http bytes to targetConn: ", err)
 				}
 			}
 			proxy(tcpConn, targetConn)
@@ -200,13 +217,13 @@ func resetCRLF(cr1, cr2, lf1, lf2 *bool) {
 	*lf2 = false
 }
 
-func parseConnect(tcpConn io.ReadWriter) (string, []byte) {
+func parseConnect(tcpConn io.ReadWriter, connectBytes []byte) (string, []byte) {
 	cr1 := false
 	cr2 := false
 	lf1 := false
 	lf2 := false
 	BUFSIZE := 100
-	totReqBytes := []byte{}
+	totReqBytes := connectBytes
 
 	for {
 		buf := make([]byte, BUFSIZE)
@@ -251,7 +268,57 @@ func parseConnect(tcpConn io.ReadWriter) (string, []byte) {
 	totReqString := string(totReqBytes)
 	lines := strings.Split(totReqString, "\n")
 	urls := strings.Split(lines[0], " ")
+	fmt.Println("connect len: ", len(totReqBytes), string(totReqBytes[:7]))
 	return urls[1], totReqBytes
+}
+
+func isConnectRequest(tcpConn io.ReadWriter) (bool, []byte) {
+	buf := make([]byte, 7)
+	for {
+		n, err := io.ReadAtLeast(tcpConn, buf, 7)
+		if err != nil {
+			fmt.Println("connect read err: ", err)
+			return false, buf[:n]
+		}
+		if n == 7 {
+			if string(buf) == "CONNECT" {
+				return true, buf
+			} else {
+				return false, buf
+			}
+		}
+	}
+}
+
+func parseHTTPURL(tcpConn io.ReadWriter, connectBytes []byte) (string, []byte) {
+	BUFSIZE := 100
+	totReqBytes := connectBytes
+	var hostHeader bool
+	for {
+		buf := make([]byte, BUFSIZE)
+		n, err := tcpConn.Read(buf)
+		if err != nil {
+			fmt.Println("Read all err: ", err)
+		}
+		if n < BUFSIZE {
+			totReqBytes = append(totReqBytes, buf[:n]...)
+			break
+		}
+		totReqBytes = append(totReqBytes, buf[:n]...)
+		idx := strings.LastIndex(string(totReqBytes), "Host: ")
+		if idx != -1 {
+			hostHeader = true
+		}
+		if hostHeader {
+			remHdrs := strings.SplitAfterN(string(totReqBytes), "\r\n", 2)
+			if len(remHdrs) > 1 {
+				hdrs := strings.Split(string(totReqBytes), "\r\n")
+				hostHdrSplits := strings.Split(hdrs[1], "www.")
+				return string(hostHdrSplits[1]), totReqBytes
+			}
+		}
+	}
+	return "", totReqBytes
 }
 
 func readConf() (*Conf, error) {
