@@ -39,7 +39,9 @@ func main() {
 	// Now we've proper client, with or without proxy
 
 	//resp, err := client.Get(fmt.Sprintf("https://%v:%v", server,port))
-	resp, err := client.Get(fmt.Sprintf("https://gaana.com/playlist/gaana-dj-telugu-latest-hits-1"))
+	// resp, err := client.Get(fmt.Sprintf("https://gaana.com/playlist/gaana-dj-telugu-latest-hits-1"))
+	resp, err := client.Get(fmt.Sprintf("https://github.com/angristan/docker-pleroma"))
+	// resp, err := client.Get(fmt.Sprintf("http://www.htmlandcssbook.com/about/"))
 	if err != nil {
 		panic("failed to connect: " + err.Error())
 	}
